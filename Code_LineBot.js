@@ -1,3 +1,4 @@
+// Updated: 2026-05-19 17:00
 // ╔══════════════════════════════════════════════════════════════════╗
 // ║  Nice Center Oil — LINE Bot + Slip2Go  (ALL-IN-ONE v3)          ║
 // ║  Code_LineBot.gs                                                 ║
