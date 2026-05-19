@@ -251,6 +251,21 @@ function processBatch(pending, parsed, userId, groupId, replyToken) {
   var notFound = matched.filter(function(m) { return m._not_found; });
   var totalBill= found.reduce(function(s, b) { return s + parseMoneyCell(b['ยอดบิล']); }, 0);
 
+  // ── Double-use bill check ──────────────────────────────────────────
+  var usedInvoices = getUsedInvoices();
+  var duplicateBills = found.filter(function(b) {
+    return usedInvoices.indexOf(normalizeInvoice(String(b.InvoiceNo || ''))) !== -1;
+  });
+  if (duplicateBills.length > 0) {
+    var dupList = duplicateBills.map(function(b) { return b.InvoiceNo || ''; }).join(', ');
+    replyLine(replyToken, [{
+      type: 'text',
+      text: '❌ บิลถูกบันทึกแล้ว ไม่สามารถใช้ซ้ำได้\nบิลที่ซ้ำ: ' + dupList + '\nกรุณาตรวจสอบและติดต่อผู้ดูแลระบบ'
+    }]);
+    return;
+  }
+  // ──────────────────────────────────────────────────────────────────
+
   var scenario;
   if (slipCount === 1 && billCount === 1)      scenario = 'A';
   else if (slipCount === 1 && billCount > 1)   scenario = 'B';
@@ -298,6 +313,30 @@ function matchBills(customerCode, billList, debts) {
 
 function customerCodeExists(customerCode, debts) {
   return debts.some(function(d) { return String(d['รหัสหลัก'] || '').trim() === customerCode; });
+}
+
+// คืน array ของ normalized invoice ที่มีสถานะ "เรียบร้อย" ใน Slip2Go sheet แล้ว
+function getUsedInvoices() {
+  try {
+    var ss    = SpreadsheetApp.openById(cfg().SHEET_ID_SLIP);
+    var sheet = ss.getSheetByName(SH.SLIPS);
+    if (!sheet || sheet.getLastRow() < 2) return [];
+    var data    = sheet.getDataRange().getValues();
+    var headers = data[0];
+    var iInvoice = headers.indexOf('เลขที่บิล');
+    var iStatus  = headers.indexOf('สถานะ');
+    if (iInvoice < 0 || iStatus < 0) return [];
+    var used = [];
+    for (var i = 1; i < data.length; i++) {
+      var status  = String(data[i][iStatus] || '').trim();
+      var invoice = normalizeInvoice(String(data[i][iInvoice] || '').trim());
+      if (status === 'เรียบร้อย' && invoice) used.push(invoice);
+    }
+    return used;
+  } catch(e) {
+    Logger.log('[getUsedInvoices] error: ' + e.message);
+    return [];
+  }
 }
 
 function getCustomerShopName(customerCode, debts) {
@@ -713,34 +752,51 @@ function saveSlipMatching(batchRef, pairs) {
 // ═══ EXTERNAL API ══════════════════════════════════════════════════
 
 function verifyWithSlip2Go(blob) {
-  try {
-    var payload = {
-      checkDuplicate: true,
-      checkReceiver: [
-        { accountNameTH:'หจก. ไนซ์เซ็นเตอร์ออยล์' },
-        { accountNameEN:'NICESENTER O' }
-      ],
-    };
-    var res = UrlFetchApp.fetch('https://connect.slip2go.com/api/verify-slip/qr-image/info', {
-      method:'post', headers:{'Authorization':'Bearer '+cfg().SLIP2GO_KEY},
-      payload:{ file:blob, payload:JSON.stringify(payload) }, muteHttpExceptions:true,
-    });
-    var code = res.getResponseCode();
-    var body;
-    try { body=JSON.parse(res.getContentText()); } catch(e){ body={message:res.getContentText()}; }
-    Logger.log('[Slip2Go] status='+code+' body='+JSON.stringify(body).slice(0,800));
-    var msg=((body.message||body.msg||'')).toString(), msgLower=msg.toLowerCase();
-    var slipData=(body.data&&body.data.data)||body.data||null;
-    var hasSlipData=slipData&&(slipData.amount!==undefined||slipData.transRef||slipData.ref1);
-    if (code!==200&&!hasSlipData) return { success:false, message:msg||body.error||('HTTP '+code) };
-    if (hasSlipData) {
-      var warning='';
-      if (msgLower.indexOf('mismatch')!==-1) warning='บัญชีผู้รับไม่ตรง';
-      else if (msgLower.indexOf('duplicate')!==-1) warning='สลิปซ้ำ';
-      return { success:true, warning:warning, raw_message:msg, data:normalizeSlip2GoData(slipData) };
+  var MAX_ATTEMPTS = 3;
+  var RETRY_DELAY_MS = 2000;
+  var lastError = '';
+
+  for (var attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      var payload = {
+        checkDuplicate: true,
+        checkReceiver: [
+          { accountNameTH:'หจก. ไนซ์เซ็นเตอร์ออยล์' },
+          { accountNameEN:'NICESENTER O' }
+        ],
+      };
+      var res = UrlFetchApp.fetch('https://connect.slip2go.com/api/verify-slip/qr-image/info', {
+        method:'post', headers:{'Authorization':'Bearer '+cfg().SLIP2GO_KEY},
+        payload:{ file:blob, payload:JSON.stringify(payload) }, muteHttpExceptions:true,
+      });
+      var code = res.getResponseCode();
+      var body;
+      try { body=JSON.parse(res.getContentText()); } catch(e){ body={message:res.getContentText()}; }
+      Logger.log('[Slip2Go] attempt='+attempt+' status='+code+' body='+JSON.stringify(body).slice(0,800));
+      var msg=((body.message||body.msg||'')).toString(), msgLower=msg.toLowerCase();
+      var slipData=(body.data&&body.data.data)||body.data||null;
+      var hasSlipData=slipData&&(slipData.amount!==undefined||slipData.transRef||slipData.ref1);
+      if (code!==200&&!hasSlipData) {
+        lastError = msg||body.error||('HTTP '+code);
+        if (attempt < MAX_ATTEMPTS) { Utilities.sleep(RETRY_DELAY_MS); continue; }
+        return { success:false, message:lastError };
+      }
+      if (hasSlipData) {
+        var warning='';
+        if (msgLower.indexOf('mismatch')!==-1) warning='บัญชีผู้รับไม่ตรง';
+        else if (msgLower.indexOf('duplicate')!==-1) warning='สลิปซ้ำ';
+        return { success:true, warning:warning, raw_message:msg, data:normalizeSlip2GoData(slipData) };
+      }
+      lastError = msg||'ไม่สามารถอ่านสลิปได้';
+      if (attempt < MAX_ATTEMPTS) { Utilities.sleep(RETRY_DELAY_MS); continue; }
+      return { success:false, message:lastError };
+    } catch(e) {
+      lastError = e.message;
+      Logger.log('[Slip2Go] attempt='+attempt+' exception: '+e.message);
+      if (attempt < MAX_ATTEMPTS) { Utilities.sleep(RETRY_DELAY_MS); continue; }
     }
-    return { success:false, message:msg||'ไม่สามารถอ่านสลิปได้' };
-  } catch(e) { return { success:false, message:e.message }; }
+  }
+  return { success:false, message:lastError };
 }
 
 function normalizeSlip2GoData(d) {
