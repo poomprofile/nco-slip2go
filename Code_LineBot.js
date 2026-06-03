@@ -62,6 +62,14 @@ function handleEvent(ev) {
   var userId     = (ev.source && ev.source.userId)  || '';
   var groupId    = (ev.source && ev.source.groupId) || '';
   var replyToken = ev.replyToken;
+
+  // Route mileage group images to MileageBot (never replies)
+  var mileageGroupId = PropertiesService.getScriptProperties().getProperty('MILEAGE_GROUP_ID');
+  if (mileageGroupId && groupId === mileageGroupId) {
+    if (msg.type === 'image') handleMileageImage(msg.id, userId, groupId);
+    return;
+  }
+
   if (msg.type === 'image') return handleImage(msg.id, userId, groupId, replyToken);
   if (msg.type === 'text')  return handleText(msg.text, userId, groupId, replyToken);
 }
