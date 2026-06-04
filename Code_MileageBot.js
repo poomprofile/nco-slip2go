@@ -431,6 +431,7 @@ function mbLogUnknownUser(lineUserId) {
 function setupMileageBot() {
   mbEnsureMileageSheet();
   mbEnsureUsersColumns();
+  mbEnsureDebugSheet();
   console.log('[MileageBot] setupMileageBot() done');
   return { ok: true };
 }
