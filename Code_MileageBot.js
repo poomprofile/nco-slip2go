@@ -45,7 +45,8 @@ function handleMileageImage(messageId, userId, groupId) {
     var sourceFlag = null;
 
     if (blob) {
-      var visionText = mbCallVision(blob);
+      var debugCtx   = { userId: userId, dsrEmail: dsr.dsrEmail, dateStr: dateStr, session: session };
+      var visionText = mbCallVision(blob, debugCtx);
       if (visionText !== null) {
         rawMile    = mbParseOdometer(visionText);
         confidence = rawMile !== null ? 0.9 : 0;
@@ -134,29 +135,71 @@ function handleMileageImage(messageId, userId, groupId) {
 
 // ─────────────────────────────────────────────────────────────────────
 //  GOOGLE VISION API
+//  debugCtx = { userId, dsrEmail, dateStr, session } — for sheet logging
 // ─────────────────────────────────────────────────────────────────────
-function mbCallVision(blob) {
+function mbCallVision(blob, debugCtx) {
   var apiKey = mbProp('GOOGLE_VISION_API_KEY');
   if (!apiKey) { console.warn('[MileageBot] GOOGLE_VISION_API_KEY not set'); return null; }
+  debugCtx = debugCtx || {};
   try {
-    var b64     = Utilities.base64Encode(blob.getBytes());
+    var b64 = Utilities.base64Encode(blob.getBytes());
+    // Request both in one call: DOCUMENT for structured OCR, TEXT as fallback for amber LCD
     var payload = JSON.stringify({
-      requests: [{ image: { content: b64 }, features: [{ type: 'TEXT_DETECTION' }] }],
+      requests: [{
+        image: { content: b64 },
+        features: [
+          { type: 'DOCUMENT_TEXT_DETECTION' },
+          { type: 'TEXT_DETECTION' },
+        ],
+      }],
     });
     var res = UrlFetchApp.fetch(MB_VISION_URL + '?key=' + apiKey, {
       method: 'post', contentType: 'application/json',
       payload: payload, muteHttpExceptions: true,
     });
-    if (res.getResponseCode() !== 200) {
-      console.warn('[MileageBot] Vision API ' + res.getResponseCode() + ': ' + res.getContentText().slice(0, 200));
+    var httpStatus = res.getResponseCode();
+    if (httpStatus !== 200) {
+      console.warn('[MileageBot] Vision API ' + httpStatus + ': ' + res.getContentText().slice(0, 200));
+      mbLogVisionDebug(debugCtx, 'DOCUMENT+TEXT', httpStatus, '', [], null);
       return null;
     }
+
     var body = JSON.parse(res.getContentText());
-    var ann  = body.responses && body.responses[0] && body.responses[0].textAnnotations;
-    if (!ann || !ann.length) return null;
-    return ann[0].description || '';
+    var resp = body.responses && body.responses[0];
+
+    // DOCUMENT_TEXT_DETECTION → fullTextAnnotation.text
+    var docText = (resp && resp.fullTextAnnotation && resp.fullTextAnnotation.text) || '';
+
+    // TEXT_DETECTION → textAnnotations[0].description (scene text, different model)
+    var sceneText = '';
+    var words = [];
+    if (resp && resp.textAnnotations && resp.textAnnotations.length) {
+      sceneText = resp.textAnnotations[0].description || '';
+      resp.textAnnotations.slice(1, 40).forEach(function(a) {
+        if (a.description) words.push(a.description);
+      });
+    }
+
+    // Parse from DOCUMENT first; fall back to scene text if no 5-6 digit number found
+    var parsedDoc   = mbParseOdometer(docText);
+    var parsedScene = mbParseOdometer(sceneText);
+    var parsedMile  = parsedDoc !== null ? parsedDoc : parsedScene;
+    var usedMethod  = parsedDoc !== null ? 'DOCUMENT_TEXT_DETECTION'
+                    : parsedScene !== null ? 'TEXT_DETECTION(fallback)'
+                    : 'DOCUMENT+TEXT(no_parse)';
+    var bestText    = parsedDoc !== null ? docText : (sceneText || docText);
+
+    // Log both raw texts so admin can see what Vision actually returned
+    var logText = 'DOC:' + docText.slice(0, 230) + ' | SCENE:' + sceneText.slice(0, 230);
+    mbLogVisionDebug(debugCtx, usedMethod, httpStatus, logText, words, parsedMile);
+
+    console.log('[MileageBot] Vision doc=%s scene=%s parsed=%s method=%s',
+      JSON.stringify(docText).slice(0, 60), JSON.stringify(sceneText).slice(0, 60),
+      parsedMile, usedMethod);
+    return bestText || null;
   } catch (err) {
     console.error('[MileageBot] mbCallVision: ' + err.message);
+    mbLogVisionDebug(debugCtx, 'DOCUMENT+TEXT', -1, 'ERROR: ' + err.message, [], null);
     return null;
   }
 }
@@ -223,6 +266,8 @@ function mbLookupDsr(lineUserId) {
   } catch (err) {
     console.error('[MileageBot] mbLookupDsr: ' + err.message);
   }
+  // Log unregistered userId so admin can identify and map it
+  mbLogUnknownUser(lineUserId);
   return null;
 }
 
@@ -326,6 +371,58 @@ function mbEnsureUsersColumns() {
       console.log('[MileageBot] added USERS column: ' + col);
     }
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  DEBUG LOGGING → sheet 'MileageDebug' in SPREADSHEET_ID
+// ─────────────────────────────────────────────────────────────────────
+var MB_DEBUG_SHEET = 'MileageDebug';
+var MB_DEBUG_COLS  = ['timestamp','type','userId','dsrEmail','date','session',
+                      'visionMethod','httpStatus','rawText','words','parsedMile'];
+
+function mbEnsureDebugSheet() {
+  var ss    = SpreadsheetApp.openById(mbProp('SPREADSHEET_ID'));
+  var sheet = ss.getSheetByName(MB_DEBUG_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(MB_DEBUG_SHEET);
+    sheet.appendRow(MB_DEBUG_COLS);
+    sheet.getRange(1, 1, 1, MB_DEBUG_COLS.length).setFontWeight('bold').setBackground('#FFF3CD');
+  }
+  return sheet;
+}
+
+function mbLogVisionDebug(ctx, visionMethod, httpStatus, rawText, words, parsedMile) {
+  try {
+    var sheet = mbEnsureDebugSheet();
+    sheet.appendRow([
+      mbTs(),
+      'vision',
+      ctx.userId    || '',
+      ctx.dsrEmail  || '',
+      ctx.dateStr   || '',
+      ctx.session   || '',
+      visionMethod,
+      httpStatus,
+      String(rawText || '').slice(0, 500),   // cap at 500 chars
+      JSON.stringify(words || []).slice(0, 300),
+      parsedMile !== null && parsedMile !== undefined ? String(parsedMile) : '',
+    ]);
+  } catch (e) {
+    console.warn('[MileageBot] mbLogVisionDebug failed: ' + e.message);
+  }
+}
+
+function mbLogUnknownUser(lineUserId) {
+  try {
+    var sheet = mbEnsureDebugSheet();
+    sheet.appendRow([
+      mbTs(), 'lookup_fail', lineUserId,
+      '', '', '', '', '', 'lineUserId not found in USERS sheet', '', '',
+    ]);
+    console.warn('[MileageBot] unregistered lineUserId: ' + lineUserId);
+  } catch (e) {
+    console.warn('[MileageBot] mbLogUnknownUser failed: ' + e.message);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────
