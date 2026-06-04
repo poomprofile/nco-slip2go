@@ -37,6 +37,15 @@ function doGet(e) {
 }
 
 function doPost(e) {
+  // Raw catch-all — runs before any logic to confirm webhook reaches this deployment
+  try {
+    var _id = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+    var _ss = SpreadsheetApp.openById(_id);
+    var _sh = _ss.getSheetByName('Debug') || _ss.insertSheet('Debug');
+    var _body = e && e.postData ? String(e.postData.contents || '').slice(0, 400) : '(no postData)';
+    _sh.appendRow([new Date(), 'doPost', _body]);
+  } catch (_e) { console.error('[doPost-rawlog]', _e.message); }
+
   try {
     if (!e || !e.postData || !e.postData.contents) return text200('empty');
     var body = JSON.parse(e.postData.contents);
