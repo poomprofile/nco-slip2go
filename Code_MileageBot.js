@@ -27,6 +27,7 @@ var MB_COLS = [
 function handleMileageImage(messageId, userId, groupId) {
   try {
     var dsr = mbLookupDsr(userId);
+    // mbLookupDsr() calls mbLogUnknownUser() → MileageDebug 'lookup_fail' row if userId not found
     if (!dsr) {
       console.log('[MileageBot] unknown lineUserId: ' + userId);
       return;
@@ -37,6 +38,13 @@ function handleMileageImage(messageId, userId, groupId) {
     var dateStr = Utilities.formatDate(bkkDate, 'Asia/Bangkok', 'yyyy-MM-dd');
     var session = bkkDate.getHours() < MB_MORN_HOUR ? 'morning' : 'evening';
 
+    // debugCtx defined early so all downstream log calls can use it
+    var debugCtx = { userId: userId, dsrEmail: dsr.dsrEmail, dateStr: dateStr, session: session };
+
+    // Confirm DSR lookup succeeded and image fetch is starting
+    mbLogVisionDebug(debugCtx, 'process_start', 0,
+      'DSR lookup OK — fetching image messageId=' + messageId, [], null);
+
     // Download image — reuses fetchLineImage() from Code_LineBot.gs (same GAS project)
     var blob = fetchLineImage(messageId);
 
@@ -45,12 +53,15 @@ function handleMileageImage(messageId, userId, groupId) {
     var sourceFlag = null;
 
     if (blob) {
-      var debugCtx   = { userId: userId, dsrEmail: dsr.dsrEmail, dateStr: dateStr, session: session };
       var visionText = mbCallVision(blob, debugCtx);
       if (visionText !== null) {
         rawMile    = mbParseOdometer(visionText);
         confidence = rawMile !== null ? 0.9 : 0;
       }
+    } else {
+      // fetchLineImage returned null — LINE API non-200 or network error
+      mbLogVisionDebug(debugCtx, 'fetch_fail', 0,
+        'fetchLineImage returned null for messageId=' + messageId, [], null);
     }
 
     // Save photo to Drive (non-blocking; skipped if DRIVE_FOLDER_ID not set)
@@ -139,7 +150,12 @@ function handleMileageImage(messageId, userId, groupId) {
 // ─────────────────────────────────────────────────────────────────────
 function mbCallVision(blob, debugCtx) {
   var apiKey = mbProp('GOOGLE_VISION_API_KEY');
-  if (!apiKey) { console.warn('[MileageBot] GOOGLE_VISION_API_KEY not set'); return null; }
+  if (!apiKey) {
+    console.warn('[MileageBot] GOOGLE_VISION_API_KEY not set');
+    mbLogVisionDebug(debugCtx, 'no_api_key', 0,
+      'GOOGLE_VISION_API_KEY not set in Script Properties', [], null);
+    return null;
+  }
   debugCtx = debugCtx || {};
   try {
     var b64 = Utilities.base64Encode(blob.getBytes());
