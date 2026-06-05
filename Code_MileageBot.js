@@ -425,6 +425,37 @@ function mbLogUnknownUser(lineUserId) {
   }
 }
 
+// Called from Code_LineBot.gs handleEvent() for every message event.
+// Logs: source.groupId, ev.destination (body-level), source.type, match result.
+// ctx = { evType, msgType, userId, groupId, sourceType, destination, mileageGroupId, matched }
+function mbLogRouteEvent(ctx) {
+  try {
+    var sheet = mbEnsureDebugSheet();
+    var detail = 'evType='   + (ctx.evType   || '') +
+                 '|msgType=' + (ctx.msgType  || '') +
+                 '|sourceType=' + (ctx.sourceType || '') +
+                 '|groupId=' + (ctx.groupId  || '') +
+                 '|dest='    + (ctx.destination || '') +
+                 '|mileageGroupId=' + (ctx.mileageGroupId || '') +
+                 '|matched=' + (ctx.matched ? 'YES' : 'NO');
+    sheet.appendRow([
+      mbTs(),
+      'route',
+      ctx.userId || '',
+      '',   // dsrEmail — not resolved at routing stage
+      '',   // date
+      '',   // session
+      ctx.sourceType || '',   // visionMethod col → source.type
+      ctx.matched ? 'matched' : 'no_match',  // httpStatus col → routing result
+      detail,
+      '',   // words
+      '',   // parsedMile
+    ]);
+  } catch (e) {
+    console.warn('[MileageBot] mbLogRouteEvent failed: ' + e.message);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 //  ONE-TIME SETUP
 // ─────────────────────────────────────────────────────────────────────

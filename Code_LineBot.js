@@ -49,8 +49,9 @@ function doPost(e) {
   try {
     if (!e || !e.postData || !e.postData.contents) return text200('empty');
     var body = JSON.parse(e.postData.contents);
+    var dest = body.destination || '';
     (body.events || []).forEach(function(ev) {
-      try { handleEvent(ev); }
+      try { handleEvent(ev, dest); }
       catch (err) { console.error('[event]', err.message, err.stack); }
     });
     return text200('ok');
@@ -64,17 +65,34 @@ function text200(msg) { return ContentService.createTextOutput(msg); }
 
 // ═══ EVENT ROUTER ══════════════════════════════════════════════════
 
-function handleEvent(ev) {
+function handleEvent(ev, destination) {
   if (ev.type === 'follow')  return handleFollow(ev);
   if (ev.type !== 'message') return;
   var msg        = ev.message;
   var userId     = (ev.source && ev.source.userId)  || '';
-  var groupId    = (ev.source && ev.source.groupId) || '';
+  var sourceType = (ev.source && ev.source.type)    || '';
+  // groupId lives in ev.source.groupId for standard group events;
+  // some LINE API versions may also expose it at ev.groupId — check both
+  var groupId    = (ev.source && ev.source.groupId) || ev.groupId || '';
   var replyToken = ev.replyToken;
 
   // Route mileage group images to MileageBot (never replies)
   var mileageGroupId = PropertiesService.getScriptProperties().getProperty('MILEAGE_GROUP_ID');
-  if (mileageGroupId && groupId === mileageGroupId) {
+  var matchedMileage = !!(mileageGroupId && groupId && groupId === mileageGroupId);
+
+  // Log every message event to MileageDebug so routing can be audited
+  mbLogRouteEvent({
+    evType:         ev.type,
+    msgType:        msg.type,
+    userId:         userId,
+    groupId:        groupId,
+    sourceType:     sourceType,
+    destination:    destination || '',
+    mileageGroupId: mileageGroupId || '',
+    matched:        matchedMileage,
+  });
+
+  if (matchedMileage) {
     if (msg.type === 'image') handleMileageImage(msg.id, userId, groupId);
     return;
   }
