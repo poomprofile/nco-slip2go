@@ -25,6 +25,7 @@ var MB_COLS = [
 //  Signature matches the routing call: handleMileageImage(msg.id, userId, groupId)
 // ─────────────────────────────────────────────────────────────────────
 function handleMileageImage(messageId, userId, groupId) {
+  var t0 = Date.now();
   try {
     var dsr = mbLookupDsr(userId);
     // mbLookupDsr() calls mbLogUnknownUser() → MileageDebug 'lookup_fail' row if userId not found
@@ -41,12 +42,11 @@ function handleMileageImage(messageId, userId, groupId) {
     // debugCtx defined early so all downstream log calls can use it
     var debugCtx = { userId: userId, dsrEmail: dsr.dsrEmail, dateStr: dateStr, session: session };
 
-    // Confirm DSR lookup succeeded and image fetch is starting
-    mbLogVisionDebug(debugCtx, 'process_start', 0,
-      'DSR lookup OK — fetching image messageId=' + messageId, [], null);
+    // Fetch image immediately — process_start logged after to avoid adding a sheet-write delay before fetch
+    var blob = mbFetchLineImage(messageId, debugCtx);
 
-    // Download image — reuses fetchLineImage() from Code_LineBot.gs (same GAS project)
-    var blob = fetchLineImage(messageId);
+    mbLogVisionDebug(debugCtx, 'process_start', 0,
+      'DSR lookup OK — fetched messageId=' + messageId + ' elapsed=' + (Date.now() - t0) + 'ms blob=' + (blob ? 'ok' : 'null'), [], null);
 
     var rawMile    = null;
     var confidence = 0;
@@ -57,11 +57,9 @@ function handleMileageImage(messageId, userId, groupId) {
       if (visionText !== null) {
         rawMile    = mbParseOdometer(visionText);
         confidence = rawMile !== null ? 0.9 : 0;
+        mbLogVisionDebug(debugCtx, 'pre_write_check', 0,
+          'parsedMile=' + rawMile + ' visionText(50)=' + visionText.slice(0, 50), [], rawMile);
       }
-    } else {
-      // fetchLineImage returned null — LINE API non-200 or network error
-      mbLogVisionDebug(debugCtx, 'fetch_fail', 0,
-        'fetchLineImage returned null for messageId=' + messageId, [], null);
     }
 
     // Save photo to Drive (non-blocking; skipped if DRIVE_FOLDER_ID not set)
@@ -84,6 +82,29 @@ function handleMileageImage(messageId, userId, groupId) {
     var confirmedMile = rawMile;
     var pendingFill   = (rawMile === null) ? 'TRUE' : 'FALSE';
 
+    // ── Plausibility guard: reject implausible Vision readings ──
+    var _plausFlag = '', _plausMsg = '';
+    if (confirmedMile !== null) {
+      var _lastMile = mbGetLastConfirmedMile(dsr.dsrEmail, dateStr);
+      if (_lastMile !== null) {
+        if (confirmedMile < _lastMile) {
+          _plausFlag    = 'odo_regression';
+          _plausMsg     = 'ไมล์ใหม่ (' + confirmedMile + ') < ล่าสุด (' + _lastMile + ')';
+          confirmedMile = null;
+          pendingFill   = 'TRUE';
+          console.warn('[MileageBot] %s email=%s date=%s new=%s prev=%s',
+            _plausFlag, dsr.dsrEmail, dateStr, rawMile, _lastMile);
+        } else if (confirmedMile - _lastMile > 1000) {
+          _plausFlag    = 'odo_jump';
+          _plausMsg     = 'ไมล์กระโดด +' + Math.round(confirmedMile - _lastMile) + ' กม. (ล่าสุด=' + _lastMile + ')';
+          confirmedMile = null;
+          pendingFill   = 'TRUE';
+          console.warn('[MileageBot] %s email=%s date=%s new=%s prev=%s',
+            _plausFlag, dsr.dsrEmail, dateStr, rawMile, _lastMile);
+        }
+      }
+    }
+
     var startMile = '', endMile = '', distance = '';
     var morningMile = mbGetMorningConfirmed(dsr.dsrEmail, dateStr);
 
@@ -98,8 +119,8 @@ function handleMileageImage(messageId, userId, groupId) {
     }
 
     // Validation flags (note only — no reply)
-    var errorFlag = '', errorMsg = '';
-    if (session === 'evening') {
+    var errorFlag = _plausFlag, errorMsg = _plausMsg;
+    if (!errorFlag && session === 'evening') {
       if (morningMile === null) {
         errorFlag = 'no_morning';
         errorMsg  = 'ไม่มีไมล์เช้าสำหรับวันนี้';
@@ -160,6 +181,7 @@ function mbCallVision(blob, debugCtx) {
   try {
     var b64 = Utilities.base64Encode(blob.getBytes());
     // Request both in one call: DOCUMENT for structured OCR, TEXT as fallback for amber LCD
+    // languageHints:'en' tells Vision to expect digits/Latin — improves dark LCD accuracy
     var payload = JSON.stringify({
       requests: [{
         image: { content: b64 },
@@ -167,6 +189,7 @@ function mbCallVision(blob, debugCtx) {
           { type: 'DOCUMENT_TEXT_DETECTION' },
           { type: 'TEXT_DETECTION' },
         ],
+        imageContext: { languageHints: ['en'] },
       }],
     });
     var res = UrlFetchApp.fetch(MB_VISION_URL + '?key=' + apiKey, {
@@ -206,7 +229,7 @@ function mbCallVision(blob, debugCtx) {
     var bestText    = parsedDoc !== null ? docText : (sceneText || docText);
 
     // Log both raw texts so admin can see what Vision actually returned
-    var logText = 'DOC:' + docText.slice(0, 230) + ' | SCENE:' + sceneText.slice(0, 230);
+    var logText = 'DOC:' + docText.slice(0, 500) + ' | SCENE:' + sceneText.slice(0, 500);
     mbLogVisionDebug(debugCtx, usedMethod, httpStatus, logText, words, parsedMile);
 
     console.log('[MileageBot] Vision doc=%s scene=%s parsed=%s method=%s',
@@ -220,16 +243,63 @@ function mbCallVision(blob, debugCtx) {
   }
 }
 
-// Extract odometer: largest 5-6 digit number
-// Ignores temperature (2 digits), time (has colon), trip meter (3-4 digits)
+// Extract odometer reading from Vision OCR text.
+// Strategy order: ODO-proximity → direct (filtered) → adjacent-join (filtered).
+// Speedometer scale: 20-220 km/h in multiples of 20. Numbers where floor(n/1000)
+// matches a scale graduation are likely Vision artefacts (e.g. "220"+"600" → 220600).
+// NOTE: ODO proximity (Strategy 1) skips the speedo filter so a real 200,000 km reading
+// that happens to be labeled "ODO" is still returned correctly.
 function mbParseOdometer(fullText) {
   if (!fullText) return null;
-  var cleaned  = fullText.replace(/,/g, '').replace(/\./g, '');
-  var matches  = cleaned.match(/\b\d{5,6}\b/g);
-  if (!matches || !matches.length) return null;
-  var candidates = matches.map(Number).filter(function(n) { return n >= 10000 && n <= 999999; });
-  if (!candidates.length) return null;
-  return Math.max.apply(null, candidates);
+  var cleaned = fullText.replace(/,/g, '').replace(/\./g, '');
+
+  var SPEEDO = {20:1,40:1,60:1,80:1,100:1,120:1,140:1,160:1,180:1,200:1,220:1};
+  function odoRange(n)  { return n >= 10000 && n <= 999999; }
+  function notSpeedo(n) { return !SPEEDO[Math.floor(n / 1000)]; }
+
+  // Strategy 1: numbers in 60-char window after ODO/กม label — direct then adjacent pair.
+  // Speedo filter intentionally skipped: if "ODO" label is present the reading is trustworthy.
+  var odoIdx = cleaned.search(/[Oo][Dd][Oo]|กม/);
+  if (odoIdx >= 0) {
+    var region  = cleaned.substring(odoIdx, odoIdx + 60).replace(/[^0-9 \n]/g, ' ');
+    var onums   = region.match(/\d+/g) || [];
+    for (var j = 0; j < onums.length; j++) {
+      if (onums[j].length >= 5 && onums[j].length <= 6) {
+        var dv = Number(onums[j]);
+        if (odoRange(dv)) return dv;
+      }
+    }
+    // adjacent pair in ODO zone — handles "06 1996" split → 061996 → 61996
+    for (var k = 0; k < onums.length - 1; k++) {
+      var op = onums[k] + onums[k + 1];
+      if (op.length >= 5 && op.length <= 6) {
+        var ov = Number(op);
+        if (odoRange(ov)) return ov;
+      }
+    }
+  }
+
+  // Strategy 2: direct 5-6 digit number, speedometer artefacts filtered
+  var direct = cleaned.match(/\b\d{5,6}\b/g);
+  if (direct) {
+    var c2 = direct.map(Number).filter(function(n) { return odoRange(n) && notSpeedo(n); });
+    if (c2.length) return Math.max.apply(null, c2);
+  }
+
+  // Strategy 3: adjacent digit join → 5-6 digits, speedometer artefacts filtered
+  // e.g. "342 670" → 342670
+  var parts  = cleaned.match(/\d+/g) || [];
+  var joined = [];
+  for (var i = 0; i < parts.length - 1; i++) {
+    var pair = parts[i] + parts[i + 1];
+    if (pair.length >= 5 && pair.length <= 6) {
+      var pv = Number(pair);
+      if (odoRange(pv) && notSpeedo(pv)) joined.push(pv);
+    }
+  }
+  if (joined.length) return Math.max.apply(null, joined);
+
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -296,7 +366,7 @@ function mbGetPrevEveningConfirmed(dsrEmail, dateStr) {
   var prevStr = Utilities.formatDate(prev, 'Asia/Bangkok', 'yyyy-MM-dd');
   var rows    = mbGetRowsByDate(dsrEmail, prevStr);
   var eve     = rows.filter(function(r) { return r.session === 'evening'; })[0];
-  if (!eve || !eve.confirmedMile) return null;
+  if (!eve || !eve.confirmedMile || eve.errorFlag) return null;
   var n = parseFloat(eve.confirmedMile);
   return isNaN(n) ? null : n;
 }
@@ -319,11 +389,48 @@ function mbGetRowsByDate(dsrEmail, dateStr) {
     return data.slice(1)
       .map(function(row) {
         var obj = {};
-        h.forEach(function(col, i) { obj[col] = String(row[i] !== undefined ? row[i] : ''); });
+        h.forEach(function(col, i) {
+          var v = row[i];
+          obj[col] = (col === 'date' && v instanceof Date)
+            ? Utilities.formatDate(v, 'Asia/Bangkok', 'yyyy-MM-dd')
+            : String(v !== undefined ? v : '');
+        });
         return obj;
       })
       .filter(function(r) { return r.dsrEmail === dsrEmail && r.date === dateStr; });
   } catch (_) { return []; }
+}
+
+function mbGetLastConfirmedMile(dsrEmail, beforeDateStr) {
+  try {
+    var sheet = mbGetMileageSheet();
+    if (!sheet) return null;
+    var data  = sheet.getDataRange().getValues();
+    if (data.length < 2) return null;
+    var h     = data[0];
+    var eIdx  = h.indexOf('dsrEmail');
+    var dIdx  = h.indexOf('date');
+    var cmIdx = h.indexOf('confirmedMile');
+    var efIdx = h.indexOf('errorFlag');
+    if (eIdx < 0 || dIdx < 0 || cmIdx < 0) return null;
+    var best = null, bestDate = '';
+    data.slice(1).forEach(function(row) {
+      var em = String(row[eIdx] || '');
+      var d  = row[dIdx] instanceof Date
+        ? Utilities.formatDate(row[dIdx], 'Asia/Bangkok', 'yyyy-MM-dd')
+        : String(row[dIdx] || '');
+      var cm = String(row[cmIdx] || '');
+      var ef = efIdx >= 0 ? String(row[efIdx] || '') : '';
+      if (em !== dsrEmail) return;
+      if (!d || d >= beforeDateStr) return;
+      if (ef) return;
+      if (!cm) return;
+      var n = parseFloat(cm);
+      if (isNaN(n) || n <= 0) return;
+      if (d > bestDate) { best = n; bestDate = d; }
+    });
+    return best;
+  } catch (_) { return null; }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -484,8 +591,80 @@ function setupMileageBot() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+//  LINE IMAGE FETCH — requires LINE_MILEAGE_TOKEN in Script Properties
+//  Logs HTTP status + error to MileageDebug on failure
+// ─────────────────────────────────────────────────────────────────────
+function mbFetchLineImage(messageId, debugCtx) {
+  var token = PropertiesService.getScriptProperties().getProperty('LINE_MILEAGE_TOKEN');
+  var tokenPreview = token ? token.substring(0, 10) : 'NULL';
+  mbLogVisionDebug(debugCtx, 'token_check', 0,
+    'LINE_MILEAGE_TOKEN first10=' + tokenPreview + ' messageId=' + messageId, [], null);
+  if (!token) {
+    var msg = 'LINE_MILEAGE_TOKEN not set in Script Properties';
+    mbLogVisionDebug(debugCtx, 'fetch_fail', -1, msg, [], null);
+    console.error('[MileageBot] mbFetchLineImage: ' + msg);
+    throw new Error(msg);
+  }
+  var url = 'https://api-data.line.me/v2/bot/message/' + messageId + '/content';
+  try {
+    var res    = UrlFetchApp.fetch(url, {
+      headers: { 'Authorization': 'Bearer ' + token },
+      muteHttpExceptions: true,
+    });
+    var status = res.getResponseCode();
+    if (status !== 200) {
+      var body = res.getContentText().slice(0, 300);
+      mbLogVisionDebug(debugCtx, 'fetch_fail', status,
+        'LINE Content API ' + status + ' token=LINE_MILEAGE_TOKEN url=' + url + ' body=' + body,
+        [], null);
+      console.warn('[MileageBot] mbFetchLineImage status=' + status + ' body=' + body);
+      return null;
+    }
+    console.log('[MileageBot] mbFetchLineImage OK status=200');
+    return res.getBlob().setName('mileage_' + messageId + '.jpg');
+  } catch (e) {
+    mbLogVisionDebug(debugCtx, 'fetch_fail', -1,
+      'fetchLineImage exception err=' + e.message,
+      [], null);
+    console.error('[MileageBot] mbFetchLineImage exception: ' + e.message);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 //  UTILITY
 // ─────────────────────────────────────────────────────────────────────
 function mbProp(key) { return PropertiesService.getScriptProperties().getProperty(key) || ''; }
 function mbUuid()    { return Utilities.getUuid().replace(/-/g, '').slice(0, 16); }
 function mbTs()      { return Utilities.formatDate(new Date(), 'Asia/Bangkok', 'yyyy-MM-dd HH:mm:ss'); }
+
+// ─────────────────────────────────────────────────────────────────────
+//  TEST — run manually from Apps Script Editor to verify LINE_MILEAGE_TOKEN
+// ─────────────────────────────────────────────────────────────────────
+function testLineImageFetch() {
+  var token     = PropertiesService.getScriptProperties().getProperty('LINE_MILEAGE_TOKEN');
+  var messageId = '617714165360623857'; // from MileageDebug row 72
+  var url       = 'https://api-data.line.me/v2/bot/message/' + messageId + '/content';
+  var res       = UrlFetchApp.fetch(url, {
+    headers: { Authorization: 'Bearer ' + token },
+    muteHttpExceptions: true,
+  });
+  console.log('status:', res.getResponseCode());
+  console.log('body:',   res.getContentText().substring(0, 500));
+}
+
+function testMileageDateType() {
+  var sheet = mbGetMileageSheet();
+  if (!sheet) { console.log('[test] Mileage sheet not found'); return; }
+  var h    = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var row1 = sheet.getRange(2, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var dIdx = h.indexOf('date');
+  console.log('[test] date col index: %s', dIdx);
+  console.log('[test] date raw value: %s', row1[dIdx]);
+  console.log('[test] date typeof: %s', typeof row1[dIdx]);
+  console.log('[test] date instanceof Date: %s', row1[dIdx] instanceof Date);
+  if (row1[dIdx] instanceof Date) {
+    console.log('[test] date formatted: %s',
+      Utilities.formatDate(row1[dIdx], 'Asia/Bangkok', 'yyyy-MM-dd'));
+  }
+}
