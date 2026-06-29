@@ -49,6 +49,7 @@ function handleMileageImage(messageId, userId, groupId) {
       'DSR lookup OK — fetched messageId=' + messageId + ' elapsed=' + (Date.now() - t0) + 'ms blob=' + (blob ? 'ok' : 'null'), [], null);
 
     var rawMile    = null;
+    var _parsedRaw = null;  // mbParseOdometer output ก่อน prevDay fallback จะ overwrite rawMile
     var confidence = 0;
     var sourceFlag = null;
 
@@ -56,6 +57,7 @@ function handleMileageImage(messageId, userId, groupId) {
       var visionText = mbCallVision(blob, debugCtx);
       if (visionText !== null) {
         rawMile    = mbParseOdometer(visionText);
+        _parsedRaw = rawMile;  // capture ก่อนบรรทัด prevDay fallback
         confidence = rawMile !== null ? 0.9 : 0;
         mbLogVisionDebug(debugCtx, 'pre_write_check', 0,
           'parsedMile=' + rawMile + ' visionText(50)=' + visionText.slice(0, 50), [], rawMile);
@@ -138,7 +140,7 @@ function handleMileageImage(messageId, userId, groupId) {
       dsrEmail:      dsr.dsrEmail,
       date:          dateStr,
       session:       session,
-      rawMile:       (rawMile !== null) ? String(rawMile) : '',
+      rawMile:       (_parsedRaw !== null) ? String(_parsedRaw) : '',
       confirmedMile: (confirmedMile !== null) ? String(confirmedMile) : '',
       startMile:     startMile,
       endMile:       endMile,
@@ -251,7 +253,8 @@ function mbCallVision(blob, debugCtx) {
 // that happens to be labeled "ODO" is still returned correctly.
 function mbParseOdometer(fullText) {
   if (!fullText) return null;
-  var cleaned = fullText.replace(/,/g, '').replace(/\./g, '');
+  var cleaned  = fullText.replace(/,/g, '').replace(/\./g, '');
+  var cleaned2 = fullText.replace(/,/g, ''); // dots preserved — ป้องกัน "1421.2"→"14212" false positive
 
   var SPEEDO = {20:1,40:1,60:1,80:1,100:1,120:1,140:1,160:1,180:1,200:1,220:1};
   function odoRange(n)  { return n >= 10000 && n <= 999999; }
@@ -279,8 +282,10 @@ function mbParseOdometer(fullText) {
     }
   }
 
-  // Strategy 2: direct 5-6 digit number, speedometer artefacts filtered
-  var direct = cleaned.match(/\b\d{5,6}\b/g);
+  // Strategy 2: direct 5-6 digit number, speedometer artefacts filtered.
+  // (?<!\d)/(?!\d) แทน \b — จับ "063950km" ได้ (k เป็น word char ทำให้ \b fail)
+  // ใช้ cleaned2 (dots preserved) ป้องกัน "1421.2" → "14212" false positive
+  var direct = cleaned2.match(/(?<!\d)\d{5,6}(?!\d)/g);
   if (direct) {
     var c2 = direct.map(Number).filter(function(n) { return odoRange(n) && notSpeedo(n); });
     if (c2.length) return Math.max.apply(null, c2);
@@ -478,6 +483,19 @@ function mbEnsureMileageSheet() {
     sheet.appendRow(MB_COLS);
     sheet.getRange(1, 1, 1, MB_COLS.length).setFontWeight('bold').setBackground('#F3F4F6');
     console.log('[MileageBot] created Mileage sheet');
+  }
+  mbEnsureMileageColumns();
+}
+
+// เพิ่ม column rawMile ต่อท้าย Mileage sheet ถ้ายังไม่มี (sheet เก่าที่สร้างก่อน rawMile เข้า MB_COLS)
+function mbEnsureMileageColumns() {
+  var ss      = SpreadsheetApp.openById(mbProp('SPREADSHEET_ID'));
+  var sheet   = ss.getSheetByName(MB_SHEET_NAME);
+  if (!sheet) return;
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  if (headers.indexOf('rawMile') < 0) {
+    sheet.getRange(1, sheet.getLastColumn() + 1).setValue('rawMile').setFontWeight('bold');
+    console.log('[MileageBot] added Mileage column: rawMile');
   }
 }
 
