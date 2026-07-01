@@ -37,15 +37,6 @@ function doGet(e) {
 }
 
 function doPost(e) {
-  // Raw catch-all — runs before any logic to confirm webhook reaches this deployment
-  try {
-    var _id = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
-    var _ss = SpreadsheetApp.openById(_id);
-    var _sh = _ss.getSheetByName('Debug') || _ss.insertSheet('Debug');
-    var _body = e && e.postData ? String(e.postData.contents || '').slice(0, 400) : '(no postData)';
-    _sh.appendRow([new Date(), 'doPost', _body]);
-  } catch (_e) { console.error('[doPost-rawlog]', _e.message); }
-
   try {
     if (!e || !e.postData || !e.postData.contents) return text200('empty');
     var body = JSON.parse(e.postData.contents);
@@ -1018,16 +1009,17 @@ function escapeHtmlSrv(s) {
 function getAllDebts() {
   var results = [];
 
-  // ── 1. บิลค้างจ่าย (บิลหลัก) ────────────────────────────────
+  // ── 1. import_debt_initial (บิลสด แทน บิลค้างจ่าย stale) ────
   try {
     var ss    = SpreadsheetApp.openById(cfg().SHEET_ID_SLIP);
-    var sheet = ss.getSheetByName(SH.DEBTS);
+    var sheet = ss.getSheetByName('import_debt_initial');
     if (sheet) {
       var data = sheet.getDataRange().getValues();
       if (data.length >= 2) {
         var h = data[0];
         data.slice(1).filter(function(r){ return r[0]; }).forEach(function(row){
-          var obj = {}; h.forEach(function(k,i){ obj[k]=row[i]; });
+          var obj = {}; h.forEach(function(k,i){ obj[String(k).trim()]=row[i]; });
+          obj.InvoiceNo = obj.DocNo || obj.InvoiceNo; // DocNo=CR69431-21545 → normalize → 431-21545
           results.push(obj);
         });
       }
