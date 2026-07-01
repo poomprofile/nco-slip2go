@@ -287,7 +287,7 @@ function mbParseOdometer(fullText) {
   // ใช้ cleaned2 (dots preserved) ป้องกัน "1421.2" → "14212" false positive
   var direct = cleaned2.match(/(?<!\d)\d{5,6}(?!\d)/g);
   if (direct) {
-    var c2 = direct.map(Number).filter(function(n) { return odoRange(n) && notSpeedo(n); });
+    var c2 = direct.map(Number).filter(function(n) { return odoRange(n); });
     if (c2.length) return Math.max.apply(null, c2);
   }
 
